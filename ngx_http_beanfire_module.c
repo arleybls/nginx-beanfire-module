@@ -152,7 +152,7 @@ ngx_http_beanfire_handler( ngx_http_request_t *r ){
                                                       " \"status\": \"%u\","
                                                       " \"bytes_sent\": \"%d\","
                                                       " \"http_referer\": \"%s\","
-                                                      " \"http_user_agent\": \"%s\"	} ";
+                                                      " \"http_user_agent\": \"%s\" }";
     
     char                              *cmdbuff, *jsonmsg;       
     int                                len;
