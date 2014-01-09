@@ -17,10 +17,10 @@
 #define BEAN_MAX_CONNECTIONS 1
         
 typedef struct {
-    ngx_str_t   beanf_server;    // Defined once on main
-    ngx_uint_t  beanf_port;      // Defined once on main
-    ngx_uint_t  beanf_retries;   // Defined once on main
-    ngx_uint_t  beanf_polling;   // Defined once on main
+    ngx_str_t   beanf_server;    
+    ngx_uint_t  beanf_port;      
+    ngx_uint_t  beanf_retries;   
+    ngx_uint_t  beanf_polling;   
 } ngx_http_beanfire_mod_main_conf_t;
 
 
@@ -138,9 +138,6 @@ ngx_module_t ngx_http_beanfire_module = {
     NULL,                                  
     NGX_MODULE_V1_PADDING
 };
-
-
-
 static ngx_int_t
 ngx_http_beanfire_handler( ngx_http_request_t *r ){
     ngx_http_beanfire_mod_loc_conf_t  *clcf;
@@ -329,9 +326,6 @@ ngx_http_beanfire_worker_init( ngx_cycle_t *c ){
     }
     return NGX_OK;
 };
-
-
-
 static void *
 ngx_http_beanfire_keepalive( void *arg ){
     struct  sockaddr_in  saddr;
