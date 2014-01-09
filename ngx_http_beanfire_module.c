@@ -141,21 +141,22 @@ ngx_module_t ngx_http_beanfire_module = {
 static ngx_int_t
 ngx_http_beanfire_handler( ngx_http_request_t *r ){
     ngx_http_beanfire_mod_loc_conf_t  *clcf;
-    char                               msgformat[] = "use %s\r\nput %d %d %d %d\r\n%s\r\n";
-    char                               ngxformat[] = "%s - %s [%s] \"%s %s %s\" %u %d \"%s\" \"%s\"";
-    char                               jsnformat[] = "{ \"remote_addr\": \"%s\","
-                                                      " \"remote_user\": \"%s\","
-                                                      " \"time_local\": \"%s\","
-                                                      " \"method\": \"%s\","
-                                                      " \"request\": \"%s\","
-                                                      " \"protocol\": \"%s\","
-                                                      " \"status\": \"%u\","
-                                                      " \"bytes_sent\": \"%d\","
-                                                      " \"http_referer\": \"%s\","
-                                                      " \"http_user_agent\": \"%s\" }";
     
-    char                              *cmdbuff, *jsonmsg;       
-    int                                len;
+    char    msgformat[] = "use %s\r\nput %d %d %d %d\r\n%s\r\n";
+    char    ngxformat[] = "%s - %s [%s] \"%s %s %s\" %u %d \"%s\" \"%s\"";
+    char    jsnformat[] = "{ \"remote_addr\": \"%s\","
+                           " \"remote_user\": \"%s\","
+                           " \"time_local\": \"%s\","
+                           " \"method\": \"%s\","
+                           " \"request\": \"%s\","
+                           " \"protocol\": \"%s\","
+                           " \"status\": \"%u\","
+                           " \"bytes_sent\": \"%d\","
+                           " \"http_referer\": \"%s\","
+                           " \"http_user_agent\": \"%s\" }";
+    
+    char   *cmdbuff, *jsonmsg;       
+    int     len;
     
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_beanfire_module);
                 
