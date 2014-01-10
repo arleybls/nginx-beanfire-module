@@ -406,12 +406,12 @@ int ngx_http_beanfire_connect(struct sockaddr_in target , int epfd, ngx_cycle_t 
      
     if((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0){
         ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0, 
-                         "[BEANFIRE][%d|d]: Error creating socket().", pid, ppid );
+                         "[BEANFIRE][%d|%d]: Error creating socket().", pid, ppid );
         return 1;
     }
     if(setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(int)) == -1){
         ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0, 
-                         "[BEANFIRE][%d|d]: Error setting socket().", pid, ppid );
+                         "[BEANFIRE][%d|%d]: Error setting socket().", pid, ppid );
         return 1;
     }
     for (;0<retries;--retries){ 
