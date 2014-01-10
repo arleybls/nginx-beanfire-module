@@ -355,7 +355,6 @@ ngx_http_beanfire_keepalive( void *arg ){
     
     epfd = epoll_create(BEAN_MAX_CONNECTIONS);
 
-    // allocate enough memory to store all the events in the "events" structure
     if (NULL == (events = calloc(BEAN_MAX_CONNECTIONS, sizeof(struct epoll_event))) ){
         ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0, 
                          "[BEANFIRE][%d|%d]: Error allocating events storage.", tid, pid );
