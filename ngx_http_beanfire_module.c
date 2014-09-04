@@ -1,5 +1,5 @@
 /*    
-    Copyright (C) 2013-2013 Arley Barros Leal da Silveira
+    Copyright (C) 2013-2014 Arley Barros Leal da Silveira
  */
 #include <ngx_config.h>
 #include <ngx_core.h>
