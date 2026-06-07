@@ -5,6 +5,7 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sys/syscall.h>
 #include <fcntl.h>
 
@@ -427,9 +428,13 @@ die:
 
 static int
 ngx_http_beanfire_connect( struct sockaddr_in target, int epfd, ngx_cycle_t *c ){
-    int yes = 1;
-    int sock;
-    int flags;
+    int            yes = 1;
+    int            sock;
+    int            flags;
+    int            so_err;
+    socklen_t      so_len;
+    int            poll_ret;
+    struct pollfd  pfd;
 
     pid_t pid  = getpid();
     pid_t ppid = getppid();
@@ -438,63 +443,111 @@ ngx_http_beanfire_connect( struct sockaddr_in target, int epfd, ngx_cycle_t *c )
 
     static struct epoll_event etevent;
 
-    if((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0){
-        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
-                         "[BEANFIRE][%d|%d]: Error creating socket().", pid, ppid );
-        return 1;
-    }
-
-    if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1){
-        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
-                         "[BEANFIRE][%d|%d]: Error setting socket().", pid, ppid );
-        close(sock);
-        return 1;
-    }
-
-    flags = fcntl(sock, F_GETFL, 0);
-    if (flags == -1 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1) {
-        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
-                         "[BEANFIRE][%d|%d]: Error setting socket non-blocking.", pid, ppid);
-        close(sock);
-        return 1;
-    }
-
     for (;0<retries;--retries){
         ngx_log_debug6(NGX_LOG_DEBUG_CORE, c->log, 0,
-                        "[BEANFIRE][%d|%d]: Retrying (%d/%d) to connect to Beanstalk server {%s:%d}", pid, ppid
-                                                                                                    , gmconf.beanf_retries + 1 - retries
-                                                                                                    , gmconf.beanf_retries
-                                                                                                    , gmconf.beanf_server.data
-                                                                                                    , gmconf.beanf_port );
-        if( connect(sock, (struct sockaddr *)&target, sizeof(struct sockaddr)) == -1 && errno != EINPROGRESS){
-            if (errno == EAGAIN) {
-                ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
-                                 "[BEANFIRE][%d|%d]: Connect is EAGAIN, out of available ports.", pid, ppid);
-                close(sock);
-                return 1;
-            }
-        } else {
-            etevent.events  = EPOLLRDHUP | EPOLLERR | EPOLLET;
-            etevent.data.fd = sock;
+                        "[BEANFIRE][%d|%d]: Trying (%d/%d) to connect to Beanstalk server {%s:%d}", pid, ppid
+                                                                                                   , gmconf.beanf_retries + 1 - retries
+                                                                                                   , gmconf.beanf_retries
+                                                                                                   , gmconf.beanf_server.data
+                                                                                                   , gmconf.beanf_port );
 
-            if(epoll_ctl((int)epfd, EPOLL_CTL_ADD, sock, &etevent) != 0){
-                ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
-                                 "[BEANFIRE][%d|%d]: Error adding socket() to epoll file descriptors.", pid, ppid);
-                close(sock);
-                return 1;
-            }
-
-            pthread_mutex_lock(&gmsofd_mutex);
-            gmsofd = sock;
-            pthread_mutex_unlock(&gmsofd_mutex);
-
+        /* POSIX: after a failed connect() the socket state is unspecified;
+           always create a fresh socket for each attempt. */
+        if((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0){
             ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
-                             "[BEANFIRE][%d|%d]: Connected to beanstalk server.", pid, ppid);
-            return 0;
+                             "[BEANFIRE][%d|%d]: Error creating socket().", pid, ppid );
+            sleep(gmconf.beanf_polling);
+            continue;
         }
-        sleep(gmconf.beanf_polling);
+
+        if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1){
+            ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                             "[BEANFIRE][%d|%d]: Error setting socket().", pid, ppid );
+            close(sock);
+            sleep(gmconf.beanf_polling);
+            continue;
+        }
+
+        flags = fcntl(sock, F_GETFL, 0);
+        if (flags == -1 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+            ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                             "[BEANFIRE][%d|%d]: Error setting socket non-blocking.", pid, ppid);
+            close(sock);
+            sleep(gmconf.beanf_polling);
+            continue;
+        }
+
+        if (connect(sock, (struct sockaddr *)&target, sizeof(struct sockaddr_in)) == -1) {
+
+            if (errno == EAGAIN) {
+                /* No local ports available — not a transient error, give up. */
+                ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                                 "[BEANFIRE][%d|%d]: Connect EAGAIN: out of local ports.", pid, ppid);
+                close(sock);
+                return 1;
+            }
+
+            if (errno != EINPROGRESS) {
+                ngx_log_debug3(NGX_LOG_DEBUG_CORE, c->log, 0,
+                                 "[BEANFIRE][%d|%d]: Connect failed: %s", pid, ppid, strerror(errno));
+                close(sock);
+                sleep(gmconf.beanf_polling);
+                continue;
+            }
+
+            /* EINPROGRESS: TCP handshake is in flight.  Wait for the socket
+               to become writable, then confirm via SO_ERROR. */
+            pfd.fd     = sock;
+            pfd.events = POLLOUT;
+            poll_ret   = poll(&pfd, 1, (int)(gmconf.beanf_polling * 1000));
+
+            if (poll_ret == 0) {
+                /* Timed out — beanf_polling seconds already elapsed. */
+                ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                                 "[BEANFIRE][%d|%d]: Connect timed out.", pid, ppid);
+                close(sock);
+                continue;
+            }
+
+            if (poll_ret < 0) {
+                ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                                 "[BEANFIRE][%d|%d]: poll() error during connect.", pid, ppid);
+                close(sock);
+                sleep(gmconf.beanf_polling);
+                continue;
+            }
+
+            so_err = 0;
+            so_len = sizeof(so_err);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &so_len) != 0 || so_err != 0) {
+                ngx_log_debug3(NGX_LOG_DEBUG_CORE, c->log, 0,
+                                 "[BEANFIRE][%d|%d]: Connect handshake failed: %s", pid, ppid, strerror(so_err));
+                close(sock);
+                sleep(gmconf.beanf_polling);
+                continue;
+            }
+        }
+
+        /* Connection established — register with epoll and publish the fd. */
+        etevent.events  = EPOLLRDHUP | EPOLLERR | EPOLLET;
+        etevent.data.fd = sock;
+
+        if(epoll_ctl((int)epfd, EPOLL_CTL_ADD, sock, &etevent) != 0){
+            ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                             "[BEANFIRE][%d|%d]: Error adding socket() to epoll file descriptors.", pid, ppid);
+            close(sock);
+            sleep(gmconf.beanf_polling);
+            continue;
+        }
+
+        pthread_mutex_lock(&gmsofd_mutex);
+        gmsofd = sock;
+        pthread_mutex_unlock(&gmsofd_mutex);
+
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                         "[BEANFIRE][%d|%d]: Connected to beanstalk server.", pid, ppid);
+        return 0;
     }
 
-    close(sock);
     return 1;
 }

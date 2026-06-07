@@ -48,8 +48,32 @@ Changes:
      the kernel since Linux 2.6.8; EPOLL_CLOEXEC prevents fd leakage
      across fork/exec.
 
-  *) Removed unused #include <poll.h>. The module uses epoll exclusively.
-
   *) Replaced #include <pthread.h> with static gmsofd_mutex initialized
      via PTHREAD_MUTEX_INITIALIZER, eliminating the need for runtime mutex
      initialization.
+
+Release 1.1.1 — 2026-06-07
+---------------------------
+
+Bug fixes:
+
+  *) Fix: connect() on the non-blocking socket returns EINPROGRESS
+     immediately, but the previous code treated that as a successful
+     connection and exposed the socket to send() before the TCP handshake
+     completed. Sends during that window failed silently with ENOTCONN.
+     The connect path now calls poll(POLLOUT) to wait for the handshake and
+     confirms the result with getsockopt(SO_ERROR) before publishing gmsofd.
+
+  *) Fix: the retry loop reused the same socket across failed connect()
+     attempts. POSIX states that after a failed connect() the socket state
+     is unspecified; a new socket must be created for each attempt. The
+     socket creation, setsockopt, and fcntl calls are now inside the loop.
+
+  *) Fix: connect() was called with sizeof(struct sockaddr) instead of
+     sizeof(struct sockaddr_in). The two are the same size on all real
+     platforms but the argument type is formally incorrect. Changed to
+     sizeof(struct sockaddr_in).
+
+Changes:
+
+  *) Re-added #include <poll.h> required by the EINPROGRESS fix above.
