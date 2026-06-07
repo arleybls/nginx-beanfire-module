@@ -1,0 +1,55 @@
+nginx-beanfire-module CHANGES
+=============================
+
+Release 1.1.0 — 2026-06-07
+---------------------------
+
+Bug fixes:
+
+  *) Fix: NULL pointer dereference when a request arrives without a
+     User-Agent header. r->headers_in.user_agent was dereferenced
+     unconditionally; it now falls back to "-" as with referer and user.
+
+  *) Fix: global socket descriptor gmsofd was zero-initialized, causing
+     dup2() to silently replace file descriptor 0 (stdin) with the
+     beanstalk socket. The descriptor is now initialized to -1 and
+     assigned directly from the connected socket without dup2().
+
+  *) Fix: race condition between the keepalive thread updating gmsofd and
+     worker request handlers calling send() on it. All access to gmsofd is
+     now serialized with a pthread_mutex. Handlers skip the send when
+     gmsofd is -1 (disconnected).
+
+  *) Fix: EPOLLERR events were silently ignored with a bare continue,
+     leaving the module sending to a broken socket indefinitely. EPOLLERR
+     now triggers the same reconnect path as EPOLLRDHUP/EPOLLHUP.
+
+  *) Fix: beanf_server.len was set to sizeof("localhost") which includes
+     the null terminator, violating nginx ngx_str_t convention. Changed to
+     sizeof("localhost") - 1.
+
+  *) Fix: inet_pton() was called with gmconf.beanf_server.data which is
+     not guaranteed to be null-terminated. The address is now copied into a
+     local null-terminated buffer before the call.
+
+  *) Fix: socket() errors in ngx_http_beanfire_connect() on the
+     setsockopt() and non-blocking fcntl() paths did not close the newly
+     created socket before returning, leaking a file descriptor on each
+     failed connect attempt.
+
+Changes:
+
+  *) The keepalive thread socket is now set to non-blocking (O_NONBLOCK)
+     before being registered with epoll, which is required for correct
+     edge-triggered (EPOLLET) behavior.
+
+  *) Replaced the deprecated epoll_create(size) call with
+     epoll_create1(EPOLL_CLOEXEC). The size argument has been ignored by
+     the kernel since Linux 2.6.8; EPOLL_CLOEXEC prevents fd leakage
+     across fork/exec.
+
+  *) Removed unused #include <poll.h>. The module uses epoll exclusively.
+
+  *) Replaced #include <pthread.h> with static gmsofd_mutex initialized
+     via PTHREAD_MUTEX_INITIALIZER, eliminating the need for runtime mutex
+     initialization.

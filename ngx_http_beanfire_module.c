@@ -1,12 +1,12 @@
-/*    
+/*
     Copyright (C) 2013-2014 Arley Barros Leal da Silveira
  */
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <pthread.h>
-#include <poll.h>
 #include <sys/syscall.h>
+#include <fcntl.h>
 
 #ifdef __GLIBC__
 #define gettid() syscall( __NR_gettid )
@@ -15,12 +15,12 @@
 #define FREE(p) (ngx_free(p), p = NULL)
 
 #define BEAN_MAX_CONNECTIONS 1
-        
+
 typedef struct {
-    ngx_str_t   beanf_server;    
-    ngx_uint_t  beanf_port;      
-    ngx_uint_t  beanf_retries;   
-    ngx_uint_t  beanf_polling;   
+    ngx_str_t   beanf_server;
+    ngx_uint_t  beanf_port;
+    ngx_uint_t  beanf_retries;
+    ngx_uint_t  beanf_polling;
 } ngx_http_beanfire_mod_main_conf_t;
 
 
@@ -30,12 +30,13 @@ typedef struct {
     ngx_str_t   beanf_tube;
     ngx_uint_t  beanf_pri;
     ngx_uint_t  beanf_delay;
-    ngx_uint_t  beanf_ttr;    
+    ngx_uint_t  beanf_ttr;
 } ngx_http_beanfire_mod_loc_conf_t;
 
 
-ngx_socket_t                       gmsofd;
-ngx_http_beanfire_mod_main_conf_t  gmconf;
+static ngx_socket_t                       gmsofd = -1;
+static pthread_mutex_t                    gmsofd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static ngx_http_beanfire_mod_main_conf_t  gmconf;
 
 
 static void        *ngx_http_beanfire_mod_create_main_conf ( ngx_conf_t * );
@@ -45,7 +46,7 @@ static char        *ngx_http_beanfire_mod_merge_loc_conf   ( ngx_conf_t *, void 
 static ngx_int_t    ngx_http_beanfire_postcfg              ( ngx_conf_t * );
 static ngx_int_t    ngx_http_beanfire_handler              ( ngx_http_request_t * );
 static void        *ngx_http_beanfire_keepalive            ( void * );
-static int          ngx_http_beanfire_connect              ( struct sockaddr_in, int, ngx_cycle_t  * );
+static int          ngx_http_beanfire_connect              ( struct sockaddr_in, int, ngx_cycle_t * );
 static ngx_int_t    ngx_http_beanfire_worker_init          ( ngx_cycle_t *cycle );
 
 
@@ -85,7 +86,7 @@ static ngx_command_t ngx_http_beanfire_commands[] = {
         ngx_conf_set_flag_slot,
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_beanfire_mod_loc_conf_t, beanf_json),
-        NULL },            
+        NULL },
     { ngx_string("beanfire_tube"),
         NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
         ngx_conf_set_str_slot,
@@ -110,38 +111,40 @@ static ngx_command_t ngx_http_beanfire_commands[] = {
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_beanfire_mod_loc_conf_t, beanf_ttr),
         NULL },
-        
+
     ngx_null_command
 };
+
 static ngx_http_module_t ngx_http_beanfire_module_ctx = {
-    NULL,                                    
-    ngx_http_beanfire_postcfg,               
-    ngx_http_beanfire_mod_create_main_conf, 
-    ngx_http_beanfire_mod_init_main_conf,   
-    NULL,                                    
-    NULL,                                    
-    ngx_http_beanfire_mod_create_loc_conf,   
-    ngx_http_beanfire_mod_merge_loc_conf     
+    NULL,
+    ngx_http_beanfire_postcfg,
+    ngx_http_beanfire_mod_create_main_conf,
+    ngx_http_beanfire_mod_init_main_conf,
+    NULL,
+    NULL,
+    ngx_http_beanfire_mod_create_loc_conf,
+    ngx_http_beanfire_mod_merge_loc_conf
 };
+
 ngx_module_t ngx_http_beanfire_module = {
     NGX_MODULE_V1,
-    &ngx_http_beanfire_module_ctx, 
-    ngx_http_beanfire_commands,          
-    NGX_HTTP_MODULE,                      
-    NULL,                                  
-    NULL,                                   
-    ngx_http_beanfire_worker_init,         
-                                                                                         
-    NULL,                                   
-    NULL,                                  
-    NULL,                                  
-    NULL,                                  
+    &ngx_http_beanfire_module_ctx,
+    ngx_http_beanfire_commands,
+    NGX_HTTP_MODULE,
+    NULL,
+    NULL,
+    ngx_http_beanfire_worker_init,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
     NGX_MODULE_V1_PADDING
 };
+
 static ngx_int_t
 ngx_http_beanfire_handler( ngx_http_request_t *r ){
     ngx_http_beanfire_mod_loc_conf_t  *clcf;
-    
+
     char    msgformat[] = "use %s\r\nput %d %d %d %d\r\n%s\r\n";
     char    ngxformat[] = "%s - %s [%s] \"%s %s %s\" %u %d \"%s\" \"%s\"";
     char    jsnformat[] = "{ \"remote_addr\": \"%s\","
@@ -154,91 +157,102 @@ ngx_http_beanfire_handler( ngx_http_request_t *r ){
                            " \"bytes_sent\": \"%d\","
                            " \"http_referer\": \"%s\","
                            " \"http_user_agent\": \"%s\" }";
-    
-    char   *cmdbuff, *jsonmsg;       
+
+    char   *cmdbuff, *jsonmsg;
     int     len;
-    
+
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_beanfire_module);
-                
-    if (!clcf->beanf_enable){ 
-        return NGX_OK;        
+
+    if (!clcf->beanf_enable){
+        return NGX_OK;
     }
-    u_char *client   = ngx_palloc(r->pool  , r->connection->addr_text.len + 1);
-                       ngx_cpystrn(client  , r->connection->addr_text.data, r->connection->addr_text.len + 1);
-                       
-    u_char *method   = ngx_palloc(r->pool  , r->method_name.len + 1);
-                       ngx_cpystrn(method  , r->method_name.data, r->method_name .len + 1);
-                       
-    u_char *request  = ngx_palloc(r->pool  , r->unparsed_uri.len + 1);
-                       ngx_cpystrn(request , r->unparsed_uri.data, r->unparsed_uri.len + 1);
-                       
-    u_char *protocol = ngx_palloc(r->pool  ,r->http_protocol.len + 1);
-                       ngx_cpystrn(protocol,r->http_protocol.data, r->http_protocol.len + 1);
-                           
+
+    u_char *client   = ngx_palloc(r->pool, r->connection->addr_text.len + 1);
+                       ngx_cpystrn(client, r->connection->addr_text.data, r->connection->addr_text.len + 1);
+
+    u_char *method   = ngx_palloc(r->pool, r->method_name.len + 1);
+                       ngx_cpystrn(method, r->method_name.data, r->method_name.len + 1);
+
+    u_char *request  = ngx_palloc(r->pool, r->unparsed_uri.len + 1);
+                       ngx_cpystrn(request, r->unparsed_uri.data, r->unparsed_uri.len + 1);
+
+    u_char *protocol = ngx_palloc(r->pool, r->http_protocol.len + 1);
+                       ngx_cpystrn(protocol, r->http_protocol.data, r->http_protocol.len + 1);
+
     u_char *user;
     if (!r->headers_in.user.len){
-        user=(u_char *)"-";
-    }else{
+        user = (u_char *)"-";
+    } else {
         user = r->headers_in.user.data;
     }
-    
+
     u_char *referer;
     if (!r->headers_in.referer){
-        referer=(u_char *)"-";
-    }else{
+        referer = (u_char *)"-";
+    } else {
         referer = r->headers_in.referer->value.data;
-    }   
-   
+    }
+
+    u_char *user_agent;
+    if (!r->headers_in.user_agent){
+        user_agent = (u_char *)"-";
+    } else {
+        user_agent = r->headers_in.user_agent->value.data;
+    }
+
     /*
      * Copyright (C) Igor Sysoev
      * Copyright (C) Nginx, Inc.
     */
     ngx_uint_t  status;
-    
+
     if (r->err_status) {
         status = r->err_status;
-
     } else if (r->headers_out.status) {
         status = r->headers_out.status;
-
     } else if (r->http_version == NGX_HTTP_VERSION_9) {
         status = 9;
-
     } else {
         status = 0;
     }
     /* end */
-  
+
     len = asprintf( &jsonmsg, (clcf->beanf_json) ? jsnformat : ngxformat
                                        , (char *) client
                                        , (char *) user
-                                       , (char *) ngx_cached_http_log_time.data 
+                                       , (char *) ngx_cached_http_log_time.data
                                        , (char *) method
                                        , (char *) request
                                        , (char *) protocol
                                        , (u_int ) status
                                        , (u_int ) r->connection->sent
                                        , (char *) referer
-                                       , (char *) r->headers_in.user_agent->value.data );     
-    
+                                       , (char *) user_agent );
+
     len = asprintf( &cmdbuff, msgformat, clcf->beanf_tube.data
                                        , clcf->beanf_pri
                                        , clcf->beanf_delay
                                        , clcf->beanf_ttr
                                        , len
                                        , jsonmsg );
- 
-    if ( -1 == send( gmsofd, cmdbuff, len, MSG_DONTWAIT )){
-         ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "[BEANFIRE] Error Sending: %s", strerror(errno));
+
+    pthread_mutex_lock(&gmsofd_mutex);
+    if (gmsofd != -1) {
+        if ( -1 == send( gmsofd, cmdbuff, len, MSG_DONTWAIT )){
+             ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "[BEANFIRE] Error Sending: %s", strerror(errno));
+        }
     }
-    FREE (cmdbuff);
-    FREE (jsonmsg);
+    pthread_mutex_unlock(&gmsofd_mutex);
+
+    FREE(cmdbuff);
+    FREE(jsonmsg);
     return NGX_OK;
 };
+
 static void *
 ngx_http_beanfire_mod_create_main_conf( ngx_conf_t *cf ){
     ngx_http_beanfire_mod_main_conf_t    *conf;
-    
+
     if(NULL == (conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_beanfire_mod_main_conf_t)))){
         return NGX_CONF_ERROR;
     }
@@ -248,11 +262,12 @@ ngx_http_beanfire_mod_create_main_conf( ngx_conf_t *cf ){
 
     return conf;
 };
+
 static void *
 ngx_http_beanfire_mod_create_loc_conf( ngx_conf_t *cf ){
     ngx_http_beanfire_mod_loc_conf_t    *conf;
-    
-    if(NULL == (conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_beanfire_mod_loc_conf_t)))     ){
+
+    if(NULL == (conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_beanfire_mod_loc_conf_t)))){
         return NGX_CONF_ERROR;
     }
     conf->beanf_enable   = NGX_CONF_UNSET;
@@ -263,13 +278,14 @@ ngx_http_beanfire_mod_create_loc_conf( ngx_conf_t *cf ){
 
     return conf;
 };
+
 static char *
 ngx_http_beanfire_mod_init_main_conf( ngx_conf_t *cf, void *parent ){
     ngx_http_beanfire_mod_main_conf_t *conf = parent;
-    
+
     if (conf->beanf_server.data == NULL ){
         conf->beanf_server.data = (u_char *) "localhost";
-        conf->beanf_server.len  = sizeof("localhost");
+        conf->beanf_server.len  = sizeof("localhost") - 1;
     }
     conf->beanf_port    = ( conf->beanf_port    == NGX_CONF_UNSET_UINT ? 11300 : conf->beanf_port    );
     conf->beanf_retries = ( conf->beanf_retries == NGX_CONF_UNSET_UINT ? 60    : conf->beanf_retries );
@@ -279,23 +295,25 @@ ngx_http_beanfire_mod_init_main_conf( ngx_conf_t *cf, void *parent ){
     gmconf.beanf_port    = conf->beanf_port;
     gmconf.beanf_polling = conf->beanf_polling;
     gmconf.beanf_retries = conf->beanf_retries;
-    
+
     return NGX_CONF_OK;
 };
+
 static char *
 ngx_http_beanfire_mod_merge_loc_conf( ngx_conf_t *cf, void *parent, void *child ){
     ngx_http_beanfire_mod_loc_conf_t *prev = parent;
     ngx_http_beanfire_mod_loc_conf_t *conf = child;
 
-    ngx_conf_merge_value     (conf->beanf_enable , prev->beanf_enable , 0             );
-    ngx_conf_merge_value     (conf->beanf_json   , prev->beanf_json   , 0             );
-    ngx_conf_merge_str_value (conf->beanf_tube   , prev->beanf_tube   , "default"     );
-    ngx_conf_merge_uint_value(conf->beanf_pri    , prev->beanf_pri    , 100           );
-    ngx_conf_merge_uint_value(conf->beanf_delay  , prev->beanf_delay  , 0             );
-    ngx_conf_merge_uint_value(conf->beanf_ttr    , prev->beanf_ttr    , 60            );
+    ngx_conf_merge_value     (conf->beanf_enable , prev->beanf_enable , 0         );
+    ngx_conf_merge_value     (conf->beanf_json   , prev->beanf_json   , 0         );
+    ngx_conf_merge_str_value (conf->beanf_tube   , prev->beanf_tube   , "default" );
+    ngx_conf_merge_uint_value(conf->beanf_pri    , prev->beanf_pri    , 100       );
+    ngx_conf_merge_uint_value(conf->beanf_delay  , prev->beanf_delay  , 0         );
+    ngx_conf_merge_uint_value(conf->beanf_ttr    , prev->beanf_ttr    , 60        );
 
     return NGX_CONF_OK;
 };
+
 static ngx_int_t
 ngx_http_beanfire_postcfg( ngx_conf_t *cf ){
     ngx_http_core_main_conf_t  *cmcf;
@@ -311,142 +329,172 @@ ngx_http_beanfire_postcfg( ngx_conf_t *cf ){
 
     return NGX_OK;
 }
+
 static ngx_int_t
 ngx_http_beanfire_worker_init( ngx_cycle_t *c ){
     pthread_t    keep_thread;
 
     if ( 0 != pthread_create(&keep_thread, NULL, ngx_http_beanfire_keepalive, c ) ){
-        ngx_log_debug3(NGX_LOG_DEBUG_CORE, c->log, 0, 
+        ngx_log_debug3(NGX_LOG_DEBUG_CORE, c->log, 0,
                          "[BEANFIRE][%d|%d]: Couldn't create poll thread: %s", getpid()
                                                                              , getppid()
                                                                              , strerror(errno));
     } else {
-        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0, 
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
                          "[BEANFIRE][%d|%d]: Keepalive fired.", getpid(), getppid() );
         pthread_detach(keep_thread);
     }
     return NGX_OK;
 };
+
 static void *
 ngx_http_beanfire_keepalive( void *arg ){
     struct  sockaddr_in  saddr;
     int                  i, count, epfd;
-    
+    char                 server_addr[256];
+
     ngx_cycle_t         *c = (ngx_cycle_t *) arg;
-    
+
     pid_t tid;
-          tid = gettid(); 
+          tid = gettid();
     pid_t pid;
           pid = getpid();
-    
+
     ngx_memset(&saddr, 0, sizeof(saddr));
-    saddr.sin_family      = AF_INET;
-    saddr.sin_addr.s_addr = INADDR_ANY;
-    saddr.sin_port        = htons(gmconf.beanf_port);
-                     
-    if ( 1 != (inet_pton(AF_INET, (char *)gmconf.beanf_server.data, &saddr.sin_addr)) ){
-        ngx_log_debug4(NGX_LOG_DEBUG_CORE, c->log, 0, 
-                        "[BEANFIRE][%d|%d]: Error, inet_pton %s/%d.", tid, pid
-                                                                    , gmconf.beanf_server.data
-                                                                    , gmconf.beanf_port);
-        goto die;                
+    saddr.sin_family = AF_INET;
+    saddr.sin_port   = htons(gmconf.beanf_port);
+
+    if (gmconf.beanf_server.len >= sizeof(server_addr)) {
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                        "[BEANFIRE][%d|%d]: Server address too long.", tid, pid);
+        goto die;
     }
+    ngx_memcpy(server_addr, gmconf.beanf_server.data, gmconf.beanf_server.len);
+    server_addr[gmconf.beanf_server.len] = '\0';
+
+    if ( 1 != (inet_pton(AF_INET, server_addr, &saddr.sin_addr)) ){
+        ngx_log_debug4(NGX_LOG_DEBUG_CORE, c->log, 0,
+                        "[BEANFIRE][%d|%d]: Error, inet_pton %s/%d.", tid, pid
+                                                                    , server_addr
+                                                                    , gmconf.beanf_port);
+        goto die;
+    }
+
     static struct epoll_event *events;
-    
-    epfd = epoll_create(BEAN_MAX_CONNECTIONS);
+
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                         "[BEANFIRE][%d|%d]: Error creating epoll fd.", tid, pid);
+        goto die;
+    }
 
     if (NULL == (events = calloc(BEAN_MAX_CONNECTIONS, sizeof(struct epoll_event))) ){
-        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0, 
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
                          "[BEANFIRE][%d|%d]: Error allocating events storage.", tid, pid );
         goto die;
     }
+
     if (ngx_http_beanfire_connect(saddr, epfd, c) != 0){
-        ngx_log_debug3(NGX_LOG_DEBUG_CORE, c->log, 0, 
-                         "[BEANFIRE][%d|%d]: Couldn't connect to beanstalk server %s" , tid, pid 
-                                                                                      , gmconf.beanf_server.data );
+        ngx_log_debug3(NGX_LOG_DEBUG_CORE, c->log, 0,
+                         "[BEANFIRE][%d|%d]: Couldn't connect to beanstalk server %s", tid, pid
+                                                                                     , server_addr );
         goto die;
-    }    
+    }
+
     for(;;){
-        count = epoll_wait(epfd, events, 1, -1);       
+        count = epoll_wait(epfd, events, 1, -1);
         for(i=0;i<count;i++){
-            if (events[i].events & (EPOLLRDHUP | EPOLLHUP)){
-                ngx_log_debug3(NGX_LOG_DEBUG_CORE, c->log, 0, 
-                                 "[BEANFIRE][%d|%d]: POLLHUP(%d) => Server unreachable.", tid, pid, count);            
-                    
+            if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)){
+                ngx_log_debug4(NGX_LOG_DEBUG_CORE, c->log, 0,
+                                 "[BEANFIRE][%d|%d]: Connection lost (events=0x%x), reconnecting.", tid, pid
+                                                                                                  , events[i].events);
                 epoll_ctl(epfd, EPOLL_CTL_DEL, events[i].data.fd, NULL);
+
+                pthread_mutex_lock(&gmsofd_mutex);
                 close(events[i].data.fd);
-                ngx_http_beanfire_connect(saddr, epfd, c);  
-            }
-            if (events[i].events & EPOLLERR){
-                continue;               
+                gmsofd = -1;
+                pthread_mutex_unlock(&gmsofd_mutex);
+
+                ngx_http_beanfire_connect(saddr, epfd, c);
             }
         }
     }
     return NGX_OK;
 die:
-    return 0;       
+    return 0;
 };
-int ngx_http_beanfire_connect(struct sockaddr_in target , int epfd, ngx_cycle_t  *c ){
+
+static int
+ngx_http_beanfire_connect( struct sockaddr_in target, int epfd, ngx_cycle_t *c ){
     int yes = 1;
     int sock;
+    int flags;
 
-    ngx_http_beanfire_mod_main_conf_t *mcf;
-    
-    mcf = (ngx_http_beanfire_mod_main_conf_t *) ngx_get_conf(c->conf_ctx, ngx_http_beanfire_module);
-    
-    pid_t pid;
-          pid  = getpid();
-    pid_t ppid;
-          ppid = getppid();
-    
-    int retries =gmconf.beanf_retries;
-    
-    static struct epoll_event etevent;    
-     
+    pid_t pid  = getpid();
+    pid_t ppid = getppid();
+
+    int retries = gmconf.beanf_retries;
+
+    static struct epoll_event etevent;
+
     if((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0){
-        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0, 
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
                          "[BEANFIRE][%d|%d]: Error creating socket().", pid, ppid );
         return 1;
     }
-    if(setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(int)) == -1){
-        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0, 
+
+    if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1){
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
                          "[BEANFIRE][%d|%d]: Error setting socket().", pid, ppid );
+        close(sock);
         return 1;
     }
-    for (;0<retries;--retries){ 
+
+    flags = fcntl(sock, F_GETFL, 0);
+    if (flags == -1 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                         "[BEANFIRE][%d|%d]: Error setting socket non-blocking.", pid, ppid);
+        close(sock);
+        return 1;
+    }
+
+    for (;0<retries;--retries){
         ngx_log_debug6(NGX_LOG_DEBUG_CORE, c->log, 0,
                         "[BEANFIRE][%d|%d]: Retrying (%d/%d) to connect to Beanstalk server {%s:%d}", pid, ppid
-                                                                                                    ,gmconf.beanf_retries + 1 - retries
-                                                                                                    ,gmconf.beanf_retries
-                                                                                                    ,gmconf.beanf_server.data
-                                                                                                    ,gmconf.beanf_port );
+                                                                                                    , gmconf.beanf_retries + 1 - retries
+                                                                                                    , gmconf.beanf_retries
+                                                                                                    , gmconf.beanf_server.data
+                                                                                                    , gmconf.beanf_port );
         if( connect(sock, (struct sockaddr *)&target, sizeof(struct sockaddr)) == -1 && errno != EINPROGRESS){
             if (errno == EAGAIN) {
                 ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
-                                 "[BEANFIRE][%d|%d]: Connect is EAGAIN, out of available ports.", pid, ppid);   
+                                 "[BEANFIRE][%d|%d]: Connect is EAGAIN, out of available ports.", pid, ppid);
                 close(sock);
                 return 1;
             }
         } else {
-            etevent.events = EPOLLRDHUP | EPOLLERR | EPOLLET ;
+            etevent.events  = EPOLLRDHUP | EPOLLERR | EPOLLET;
             etevent.data.fd = sock;
 
             if(epoll_ctl((int)epfd, EPOLL_CTL_ADD, sock, &etevent) != 0){
                 ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
-                                 "[BEANFIRE][%d|%d]: Error adding socket() to epoll file descriptors.", pid, ppid);          
+                                 "[BEANFIRE][%d|%d]: Error adding socket() to epoll file descriptors.", pid, ppid);
+                close(sock);
                 return 1;
             }
-            if(-1 == dup2(sock, gmsofd)){
-                ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
-                                 "[BEANFIRE][%d|%d]: Error duplicating socket().", pid, ppid);
-                return 1;
-            } else {
-                ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
-                                 "[BEANFIRE][%d|%d]: Going to exit.", pid, ppid);
-                return 0;
-            }
+
+            pthread_mutex_lock(&gmsofd_mutex);
+            gmsofd = sock;
+            pthread_mutex_unlock(&gmsofd_mutex);
+
+            ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                             "[BEANFIRE][%d|%d]: Connected to beanstalk server.", pid, ppid);
+            return 0;
         }
         sleep(gmconf.beanf_polling);
     }
+
+    close(sock);
     return 1;
 }
